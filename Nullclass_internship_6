@@ -1,0 +1,304 @@
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+
+IMG_SIZE = 32
+NUM_CLASSES = 4
+LABELS = {0: "circle", 1: "square", 2: "triangle", 3: "star"}
+Z_DIM = 64
+HIDDEN_G = [256, 512, 1024]
+HIDDEN_D = [1024, 512, 256]
+EPOCHS = 150
+BATCH_SIZE = 64
+LR = 2e-4
+DEVICE = torch.device("cpu")
+
+
+def draw_circle(img):
+    cx, cy, r = IMG_SIZE // 2, IMG_SIZE // 2, IMG_SIZE // 2 - 4
+    for y in range(IMG_SIZE):
+        for x in range(IMG_SIZE):
+            if (x - cx) ** 2 + (y - cy) ** 2 <= r ** 2:
+                img[y, x] = 1.0
+    return img
+
+
+def draw_square(img):
+    m = 4
+    img[m:IMG_SIZE - m, m:IMG_SIZE - m] = 1.0
+    return img
+
+
+def draw_triangle(img):
+    for y in range(IMG_SIZE):
+        width = int((y / IMG_SIZE) * (IMG_SIZE - 8))
+        cx = IMG_SIZE // 2
+        img[y, max(0, cx - width // 2): min(IMG_SIZE, cx + width // 2)] = 1.0
+    return img
+
+
+def draw_star(img, pts=5):
+    cx, cy = IMG_SIZE // 2, IMG_SIZE // 2
+    outer_r = IMG_SIZE // 2 - 3
+    inner_r = outer_r / 2.5
+    angle = np.pi / pts
+    poly = []
+    for i in range(2 * pts):
+        r = outer_r if i % 2 == 0 else inner_r
+        a = i * angle - np.pi / 2
+        poly.append((cx + r * np.cos(a), cy + r * np.sin(a)))
+    for y in range(IMG_SIZE):
+        for x in range(IMG_SIZE):
+            inside = False
+            j = len(poly) - 1
+            for i in range(len(poly)):
+                xi, yi = poly[i]
+                xj, yj = poly[j]
+                if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-9) + xi):
+                    inside = not inside
+                j = i
+            if inside:
+                img[y, x] = 1.0
+    return img
+
+
+DRAW_FNS = [draw_circle, draw_square, draw_triangle, draw_star]
+
+
+def make_dataset(n_per_class=200):
+    imgs, labels = [], []
+    for cls in range(NUM_CLASSES):
+        for _ in range(n_per_class):
+            img = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
+            img = DRAW_FNS[cls](img)
+            noise = np.random.normal(0, 0.05, img.shape).astype(np.float32)
+            img = np.clip(img + noise, 0, 1)
+            imgs.append(img)
+            labels.append(cls)
+    imgs = np.stack(imgs)[:, np.newaxis]
+    return torch.tensor(imgs * 2 - 1), torch.tensor(labels, dtype=torch.long)
+
+
+class Generator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.label_emb = nn.Embedding(NUM_CLASSES, NUM_CLASSES)
+        layers = []
+        in_dim = Z_DIM + NUM_CLASSES
+        for h in HIDDEN_G:
+            layers += [nn.Linear(in_dim, h), nn.BatchNorm1d(h), nn.LeakyReLU(0.2)]
+            in_dim = h
+        layers += [nn.Linear(in_dim, IMG_SIZE * IMG_SIZE), nn.Tanh()]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, z, labels):
+        c = self.label_emb(labels)
+        x = torch.cat([z, c], dim=1)
+        return self.net(x).view(-1, 1, IMG_SIZE, IMG_SIZE)
+
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.label_emb = nn.Embedding(NUM_CLASSES, IMG_SIZE * IMG_SIZE)
+        layers = []
+        in_dim = IMG_SIZE * IMG_SIZE * 2
+        for h in HIDDEN_D:
+            layers += [nn.Linear(in_dim, h), nn.LeakyReLU(0.2), nn.Dropout(0.3)]
+            in_dim = h
+        layers += [nn.Linear(in_dim, 1), nn.Sigmoid()]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, img, labels):
+        img_flat = img.view(img.size(0), -1)
+        c = self.label_emb(labels)
+        x = torch.cat([img_flat, c], dim=1)
+        return self.net(x)
+
+
+def train(G, D, loader, epochs=EPOCHS):
+    opt_G = optim.Adam(G.parameters(), lr=LR, betas=(0.5, 0.999))
+    opt_D = optim.Adam(D.parameters(), lr=LR, betas=(0.5, 0.999))
+    criterion = nn.BCELoss()
+
+    fixed_z = torch.randn(NUM_CLASSES, Z_DIM, device=DEVICE)
+    fixed_labels = torch.arange(NUM_CLASSES, device=DEVICE)
+    snap_epochs = [1, 10, 30, 60, 100, 150]
+    snapshots = {}
+    g_losses, d_losses = [], []
+
+    for epoch in range(1, epochs + 1):
+        g_epoch, d_epoch = 0.0, 0.0
+        G.train()
+        D.train()
+        for real_imgs, real_lbls in loader:
+            real_imgs = real_imgs.to(DEVICE)
+            real_lbls = real_lbls.to(DEVICE)
+            bs = real_imgs.size(0)
+            real_t = torch.ones(bs, 1, device=DEVICE)
+            fake_t = torch.zeros(bs, 1, device=DEVICE)
+
+            opt_D.zero_grad()
+            d_real = D(real_imgs, real_lbls)
+            z = torch.randn(bs, Z_DIM, device=DEVICE)
+            fake_lbls = torch.randint(0, NUM_CLASSES, (bs,), device=DEVICE)
+            fake_imgs = G(z, fake_lbls).detach()
+            d_fake = D(fake_imgs, fake_lbls)
+            d_loss = criterion(d_real, real_t) + criterion(d_fake, fake_t)
+            d_loss.backward()
+            opt_D.step()
+
+            opt_G.zero_grad()
+            z = torch.randn(bs, Z_DIM, device=DEVICE)
+            fake_lbls = torch.randint(0, NUM_CLASSES, (bs,), device=DEVICE)
+            fake_imgs = G(z, fake_lbls)
+            g_out = D(fake_imgs, fake_lbls)
+            g_loss = criterion(g_out, real_t)
+            g_loss.backward()
+            opt_G.step()
+
+            g_epoch += g_loss.item()
+            d_epoch += d_loss.item()
+
+        g_losses.append(g_epoch / len(loader))
+        d_losses.append(d_epoch / len(loader))
+
+        if epoch in snap_epochs:
+            G.eval()
+            with torch.no_grad():
+                imgs = G(fixed_z, fixed_labels).cpu().numpy()
+            snapshots[epoch] = (imgs * 0.5 + 0.5).clip(0, 1)
+            G.train()
+
+        if epoch % 25 == 0:
+            print(f"Epoch {epoch:3d}/{epochs}  |  G: {g_losses[-1]:.4f}  D: {d_losses[-1]:.4f}")
+
+    return g_losses, d_losses, snapshots
+
+
+def plot_losses(g_losses, d_losses, snap_epochs, save_path="task2_losses.png"):
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(g_losses, label='Generator Loss', color='#E74C3C', lw=2)
+    ax.plot(d_losses, label='Discriminator Loss', color='#2ECC71', lw=2)
+    for ep in snap_epochs:
+        ax.axvline(ep - 1, color='gray', linestyle='--', alpha=0.4, lw=1)
+    ax.set_title("CGAN Training Loss Curves", fontsize=13, fontweight='bold')
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=120, bbox_inches='tight')
+    print(f"Loss plot saved to: {save_path}")
+    plt.close()
+
+
+def plot_snapshots(snapshots, save_path="task2_snapshots.png"):
+    snap_epochs = sorted(snapshots.keys())
+    fig, axes = plt.subplots(len(snap_epochs), NUM_CLASSES, figsize=(NUM_CLASSES * 2.5, len(snap_epochs) * 2.5))
+    fig.suptitle("CGAN Generated Shapes — Training Progression", fontsize=13, fontweight='bold')
+    for row, ep in enumerate(snap_epochs):
+        imgs = snapshots[ep]
+        for col in range(NUM_CLASSES):
+            ax = axes[row, col]
+            ax.imshow(imgs[col, 0], cmap='gray', vmin=0, vmax=1)
+            ax.axis('off')
+            if row == 0:
+                ax.set_title(LABELS[col], fontsize=10, fontweight='bold')
+            if col == 0:
+                ax.set_ylabel(f"Ep {ep}", fontsize=9, rotation=90, labelpad=10)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=130, bbox_inches='tight')
+    print(f"Snapshot plot saved to: {save_path}")
+    plt.close()
+
+
+def plot_final_grid(G, n_samples=6, save_path="task2_final_grid.png"):
+    G.eval()
+    fig, axes = plt.subplots(NUM_CLASSES, n_samples, figsize=(n_samples * 2, NUM_CLASSES * 2.2))
+    fig.suptitle("CGAN Final Results — Shape Generation by Label", fontsize=13, fontweight='bold')
+    with torch.no_grad():
+        for row, cls in enumerate(range(NUM_CLASSES)):
+            z_batch = torch.randn(n_samples, Z_DIM)
+            lbl_batch = torch.full((n_samples,), cls, dtype=torch.long)
+            gen = G(z_batch, lbl_batch).cpu().numpy()
+            gen = (gen * 0.5 + 0.5).clip(0, 1)
+            for col in range(n_samples):
+                ax = axes[row, col]
+                ax.imshow(gen[col, 0], cmap='gray', vmin=0, vmax=1)
+                ax.axis('off')
+                if col == 0:
+                    ax.set_ylabel(LABELS[cls], fontsize=10, fontweight='bold', rotation=90, labelpad=10)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=130, bbox_inches='tight')
+    print(f"Final grid saved to: {save_path}")
+    plt.close()
+
+
+def plot_real_vs_generated(G, X, Y, save_path="task2_real_vs_gen.png"):
+    G.eval()
+    fig, axes = plt.subplots(2, NUM_CLASSES, figsize=(NUM_CLASSES * 2.5, 5))
+    fig.suptitle("Real vs Generated Shapes", fontsize=13, fontweight='bold')
+    axes[0, 0].set_ylabel("Real", fontsize=11, fontweight='bold')
+    axes[1, 0].set_ylabel("Generated", fontsize=11, fontweight='bold')
+    for col, cls in enumerate(range(NUM_CLASSES)):
+        idx = (Y == cls).nonzero(as_tuple=True)[0][0]
+        real = (X[idx, 0].numpy() * 0.5 + 0.5).clip(0, 1)
+        axes[0, col].imshow(real, cmap='gray', vmin=0, vmax=1)
+        axes[0, col].set_title(LABELS[cls], fontsize=10, fontweight='bold')
+        axes[0, col].axis('off')
+        with torch.no_grad():
+            z1 = torch.randn(1, Z_DIM)
+            l1 = torch.tensor([cls])
+            gen1 = G(z1, l1).cpu().numpy()
+        gen1 = (gen1[0, 0] * 0.5 + 0.5).clip(0, 1)
+        axes[1, col].imshow(gen1, cmap='gray', vmin=0, vmax=1)
+        axes[1, col].axis('off')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=130, bbox_inches='tight')
+    print(f"Real vs generated plot saved to: {save_path}")
+    plt.close()
+
+
+def main():
+    print("=" * 60)
+    print("TASK 2: Conditional GAN (CGAN) for Shape Generation")
+    print("=" * 60)
+
+    print("\nCreating dataset...")
+    X, Y = make_dataset(200)
+    print(f"Dataset: {X.shape}  Labels: {LABELS}")
+
+    torch.manual_seed(42)
+    G = Generator().to(DEVICE)
+    D = Discriminator().to(DEVICE)
+    g_params = sum(p.numel() for p in G.parameters())
+    d_params = sum(p.numel() for p in D.parameters())
+    print(f"\nGenerator params:     {g_params:,}")
+    print(f"Discriminator params: {d_params:,}")
+    print(f"Total parameters:     {g_params + d_params:,}")
+
+    dataset = torch.utils.data.TensorDataset(X, Y)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    print(f"\nTraining: {EPOCHS} epochs, batch={BATCH_SIZE}, lr={LR}")
+    print("-" * 40)
+    g_losses, d_losses, snapshots = train(G, D, loader, EPOCHS)
+
+    snap_epochs = sorted(snapshots.keys())
+    print("\nGenerating plots...")
+    plot_losses(g_losses, d_losses, snap_epochs)
+    plot_snapshots(snapshots)
+    plot_final_grid(G)
+    plot_real_vs_generated(G, X, Y)
+
+    print("\nTask 2 complete.")
+
+
+if __name__ == "__main__":
+    main()
