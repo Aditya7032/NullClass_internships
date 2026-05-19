@@ -1,0 +1,233 @@
+import re
+import math
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+import torch
+import torch.nn as nn
+
+
+SPECIAL = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
+BASE_WORDS = [
+    "a", "an", "the", "with", "on", "in", "of", "and", "is", "are",
+    "red", "blue", "green", "yellow", "orange", "purple", "pink", "dark", "light", "golden",
+    "circle", "square", "triangle", "star", "diamond", "hexagon", "oval", "rectangle",
+    "background", "white", "black", "large", "small", "sharp", "rounded", "dotted", "border",
+    "center", "edges", "pointing", "upward", "shape", "forms", "basic", "color", "corner",
+    "##red", "##blue", "##gle", "##mond", "##angle", "##agon", "##ted"
+]
+
+vocab = {tok: i for i, tok in enumerate(SPECIAL + BASE_WORDS)}
+idx2tok = {v: k for k, v in vocab.items()}
+VOCAB_SIZE = len(vocab)
+MAX_LEN = 16
+HIDDEN = 128
+N_HEADS = 4
+N_LAYERS = 2
+FF_DIM = 256
+
+
+def simple_tokenize(text, max_len=MAX_LEN):
+    text = text.lower()
+    tokens = re.findall(r'\b\w+\b', text)
+    ids = [vocab["[CLS]"]]
+    for t in tokens:
+        ids.append(vocab.get(t, vocab["[UNK]"]))
+    ids.append(vocab["[SEP]"])
+    ids = ids[:max_len]
+    ids += [0] * (max_len - len(ids))
+    return ids
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=512):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+
+class MiniTransformerEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(VOCAB_SIZE, HIDDEN, padding_idx=0)
+        self.pos_enc = PositionalEncoding(HIDDEN)
+        layer = nn.TransformerEncoderLayer(
+            d_model=HIDDEN, nhead=N_HEADS, dim_feedforward=FF_DIM,
+            dropout=0.0, batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=N_LAYERS)
+        self.layer_norm = nn.LayerNorm(HIDDEN)
+
+    def forward(self, input_ids, attention_mask=None):
+        x = self.embedding(input_ids)
+        x = self.pos_enc(x)
+        key_padding_mask = (attention_mask == 0) if attention_mask is not None else None
+        x = self.encoder(x, src_key_padding_mask=key_padding_mask)
+        return self.layer_norm(x)
+
+
+def tokenize_batch(texts):
+    all_ids = [simple_tokenize(t) for t in texts]
+    masks = [[1 if tok != 0 else 0 for tok in row] for row in all_ids]
+    return (
+        torch.tensor(all_ids, dtype=torch.long),
+        torch.tensor(masks, dtype=torch.long)
+    )
+
+
+def get_embeddings(model, input_ids, attn_mask):
+    model.eval()
+    with torch.no_grad():
+        last_hidden = model(input_ids, attn_mask)
+    cls_embeddings = last_hidden[:, 0, :]
+    return last_hidden, cls_embeddings
+
+
+def print_summary(texts, cls_embeddings):
+    emb_np = cls_embeddings.numpy()
+    print(f"\n{'#':<4} {'Text (truncated)':<42} {'Emb dim':<10} {'L2 Norm':>9}")
+    print("─" * 68)
+    for i, (t, emb) in enumerate(zip(texts, emb_np)):
+        norm = np.linalg.norm(emb)
+        print(f"{i+1:<4} {t[:40]:<42} {len(emb):<10} {norm:>9.4f}")
+
+
+def plot_embeddings(texts, cls_embeddings, last_hidden, input_ids, save_path="task1_embeddings.png"):
+    short = ["circle", "square", "triangle", "star", "diamond", "rectangle", "oval", "hexagon"]
+    emb_np = cls_embeddings.numpy()
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Task 1 — Text Embedding Visualization (BERT-style Transformer)", fontsize=14, fontweight='bold')
+
+    ax = axes[0, 0]
+    im = ax.imshow(emb_np, aspect='auto', cmap='RdYlBu')
+    ax.set_title("CLS Embedding Heatmap (all dims)")
+    ax.set_xlabel("Embedding Dimension (0–127)")
+    ax.set_ylabel("Text Sample")
+    ax.set_yticks(range(len(texts)))
+    ax.set_yticklabels([f"[{i+1}] {t[:22]}..." for i, t in enumerate(texts)], fontsize=7)
+    plt.colorbar(im, ax=ax)
+
+    ax = axes[0, 1]
+    pca = PCA(n_components=2)
+    emb_2d = pca.fit_transform(emb_np)
+    colors = plt.cm.Set1(np.linspace(0, 1, len(texts)))
+    for i, (x, y) in enumerate(emb_2d):
+        ax.scatter(x, y, c=[colors[i]], s=140, zorder=5)
+        ax.annotate(short[i], (x, y), textcoords="offset points", xytext=(7, 4), fontsize=9)
+    ax.set_title(f"PCA (2D) — variance explained: {sum(pca.explained_variance_ratio_)*100:.1f}%")
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1, 0]
+    norms = np.linalg.norm(emb_np, axis=1, keepdims=True)
+    normed = emb_np / (norms + 1e-8)
+    sim = normed @ normed.T
+    im2 = ax.imshow(sim, cmap='coolwarm', vmin=sim.min()-0.01, vmax=1.0)
+    ax.set_title("Cosine Similarity Matrix")
+    ax.set_xticks(range(len(texts)))
+    ax.set_yticks(range(len(texts)))
+    ax.set_xticklabels(short, rotation=45, ha='right', fontsize=8)
+    ax.set_yticklabels(short, fontsize=8)
+    for i in range(len(texts)):
+        for j in range(len(texts)):
+            ax.text(j, i, f"{sim[i,j]:.2f}", ha='center', va='center', fontsize=7)
+    plt.colorbar(im2, ax=ax)
+
+    ax = axes[1, 1]
+    norms_vals = np.linalg.norm(emb_np, axis=1)
+    bars = ax.bar(range(len(texts)), norms_vals, color=colors, edgecolor='black', linewidth=0.7)
+    ax.set_title("L2 Norm of Each CLS Embedding")
+    ax.set_xlabel("Text Sample")
+    ax.set_ylabel("L2 Norm")
+    ax.set_xticks(range(len(texts)))
+    ax.set_xticklabels(short, rotation=30, ha='right')
+    for bar, val in zip(bars, norms_vals):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                f"{val:.3f}", ha='center', va='bottom', fontsize=8)
+    ax.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=120, bbox_inches='tight')
+    print(f"Embedding plot saved to: {save_path}")
+    plt.close()
+
+    fig2, axes2 = plt.subplots(2, 4, figsize=(16, 6))
+    fig2.suptitle("Token-Level Embedding Norms per Text", fontsize=13, fontweight='bold')
+    for idx in range(8):
+        ax = axes2[idx // 4][idx % 4]
+        token_ids = input_ids[idx].tolist()
+        token_embs = last_hidden[idx].detach().numpy()
+        token_norms = np.linalg.norm(token_embs, axis=1)
+        tok_labels = [idx2tok.get(i, '?') for i in token_ids if i != 0]
+        norms_plot = token_norms[:len(tok_labels)]
+        c = plt.cm.viridis(norms_plot / norms_plot.max())
+        ax.bar(range(len(tok_labels)), norms_plot, color=c, edgecolor='gray', linewidth=0.5)
+        ax.set_xticks(range(len(tok_labels)))
+        ax.set_xticklabels(tok_labels, rotation=45, ha='right', fontsize=7)
+        ax.set_title(short[idx], fontsize=9)
+        ax.set_ylabel("L2 Norm", fontsize=7)
+        ax.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    token_path = save_path.replace('.png', '_token_norms.png')
+    plt.savefig(token_path, dpi=120, bbox_inches='tight')
+    print(f"Token norm plot saved to: {token_path}")
+    plt.close()
+
+
+def main():
+    print("=" * 60)
+    print("TASK 1: Text Preprocessing with Transformer Embeddings")
+    print("=" * 60)
+
+    print(f"\nVocabulary size: {VOCAB_SIZE}")
+    print(f"Special tokens:  {SPECIAL}")
+
+    texts = [
+        "A red circle on a white background",
+        "A blue square with sharp edges",
+        "A green triangle pointing upward",
+        "A large yellow star shape",
+        "A small purple diamond in the center",
+        "An orange rectangle with rounded corners",
+        "A pink oval with a dotted border",
+        "A dark hexagon with golden edges"
+    ]
+
+    print("\nSample Texts:")
+    for i, t in enumerate(texts):
+        print(f"  [{i+1}] {t}")
+
+    input_ids, attn_mask = tokenize_batch(texts)
+    print(f"\nInput IDs shape:      {list(input_ids.shape)}")
+    print(f"Attention Mask shape: {list(attn_mask.shape)}")
+    print(f"\nSample Token IDs (Text 1):\n  {input_ids[0].tolist()}")
+    decoded = [idx2tok.get(i, '[UNK]') for i in input_ids[0].tolist() if i != 0]
+    print(f"\nDecoded tokens (Text 1):\n  {decoded}")
+
+    torch.manual_seed(42)
+    model = MiniTransformerEncoder()
+    params = sum(p.numel() for p in model.parameters())
+    print(f"\nTransformer Encoder: hidden={HIDDEN}, heads={N_HEADS}, layers={N_LAYERS}, params={params:,}")
+
+    last_hidden, cls_embeddings = get_embeddings(model, input_ids, attn_mask)
+    print(f"\nLast Hidden State: {list(last_hidden.shape)}")
+    print(f"CLS Embeddings:    {list(cls_embeddings.shape)}")
+
+    print_summary(texts, cls_embeddings)
+    plot_embeddings(texts, cls_embeddings, last_hidden, input_ids)
+    print("\nTask 1 complete.")
+
+
+if __name__ == "__main__":
+    main()
